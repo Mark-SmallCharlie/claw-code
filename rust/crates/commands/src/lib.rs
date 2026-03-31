@@ -30,6 +30,85 @@ impl CommandRegistry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlashCommandSpec {
+    pub name: &'static str,
+    pub summary: &'static str,
+    pub argument_hint: Option<&'static str>,
+}
+
+const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
+    SlashCommandSpec {
+        name: "help",
+        summary: "Show available slash commands",
+        argument_hint: None,
+    },
+    SlashCommandSpec {
+        name: "status",
+        summary: "Show current session status",
+        argument_hint: None,
+    },
+    SlashCommandSpec {
+        name: "compact",
+        summary: "Compact local session history",
+        argument_hint: None,
+    },
+    SlashCommandSpec {
+        name: "model",
+        summary: "Show or switch the active model",
+        argument_hint: Some("[model]"),
+    },
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashCommand {
+    Help,
+    Status,
+    Compact,
+    Model { model: Option<String> },
+    Unknown(String),
+}
+
+impl SlashCommand {
+    #[must_use]
+    pub fn parse(input: &str) -> Option<Self> {
+        let trimmed = input.trim();
+        if !trimmed.starts_with('/') {
+            return None;
+        }
+
+        let mut parts = trimmed.trim_start_matches('/').split_whitespace();
+        let command = parts.next().unwrap_or_default();
+        Some(match command {
+            "help" => Self::Help,
+            "status" => Self::Status,
+            "compact" => Self::Compact,
+            "model" => Self::Model {
+                model: parts.next().map(ToOwned::to_owned),
+            },
+            other => Self::Unknown(other.to_string()),
+        })
+    }
+}
+
+#[must_use]
+pub fn slash_command_specs() -> &'static [SlashCommandSpec] {
+    SLASH_COMMAND_SPECS
+}
+
+#[must_use]
+pub fn render_slash_command_help() -> String {
+    let mut lines = vec!["Available commands:".to_string()];
+    for spec in slash_command_specs() {
+        let name = match spec.argument_hint {
+            Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
+            None => format!("/{}", spec.name),
+        };
+        lines.push(format!("  {name:<20} {}", spec.summary));
+    }
+    lines.join("\n")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommandResult {
     pub message: String,
@@ -42,13 +121,8 @@ pub fn handle_slash_command(
     session: &Session,
     compaction: CompactionConfig,
 ) -> Option<SlashCommandResult> {
-    let trimmed = input.trim();
-    if !trimmed.starts_with('/') {
-        return None;
-    }
-
-    match trimmed.split_whitespace().next() {
-        Some("/compact") => {
+    match SlashCommand::parse(input)? {
+        SlashCommand::Compact => {
             let result = compact_session(session, compaction);
             let message = if result.removed_message_count == 0 {
                 "Compaction skipped: session is below the compaction threshold.".to_string()
@@ -63,14 +137,46 @@ pub fn handle_slash_command(
                 session: result.compacted_session,
             })
         }
-        _ => None,
+        SlashCommand::Help => Some(SlashCommandResult {
+            message: render_slash_command_help(),
+            session: session.clone(),
+        }),
+        SlashCommand::Status | SlashCommand::Model { .. } | SlashCommand::Unknown(_) => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::handle_slash_command;
+    use super::{
+        handle_slash_command, render_slash_command_help, slash_command_specs, SlashCommand,
+    };
     use runtime::{CompactionConfig, ContentBlock, ConversationMessage, MessageRole, Session};
+
+    #[test]
+    fn parses_supported_slash_commands() {
+        assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
+        assert_eq!(SlashCommand::parse(" /status "), Some(SlashCommand::Status));
+        assert_eq!(
+            SlashCommand::parse("/model claude-opus"),
+            Some(SlashCommand::Model {
+                model: Some("claude-opus".to_string()),
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/model"),
+            Some(SlashCommand::Model { model: None })
+        );
+    }
+
+    #[test]
+    fn renders_help_from_shared_specs() {
+        let help = render_slash_command_help();
+        assert!(help.contains("/help"));
+        assert!(help.contains("/status"));
+        assert!(help.contains("/compact"));
+        assert!(help.contains("/model [model]"));
+        assert_eq!(slash_command_specs().len(), 4);
+    }
 
     #[test]
     fn compacts_sessions_via_slash_command() {
@@ -103,8 +209,21 @@ mod tests {
     }
 
     #[test]
-    fn ignores_unknown_slash_commands() {
+    fn help_command_is_non_mutating() {
+        let session = Session::new();
+        let result = handle_slash_command("/help", &session, CompactionConfig::default())
+            .expect("help command should be handled");
+        assert_eq!(result.session, session);
+        assert!(result.message.contains("Available commands:"));
+    }
+
+    #[test]
+    fn ignores_unknown_or_runtime_bound_slash_commands() {
         let session = Session::new();
         assert!(handle_slash_command("/unknown", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command("/status", &session, CompactionConfig::default()).is_none());
+        assert!(
+            handle_slash_command("/model claude", &session, CompactionConfig::default()).is_none()
+        );
     }
 }

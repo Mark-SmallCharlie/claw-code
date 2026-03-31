@@ -11,7 +11,7 @@ use api::{
     ToolResultContentBlock,
 };
 
-use commands::handle_slash_command;
+use commands::{handle_slash_command, render_slash_command_help, SlashCommand};
 use compat_harness::{extract_manifest, UpstreamPaths};
 use render::{Spinner, TerminalRenderer};
 use runtime::{
@@ -82,7 +82,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
-                model = value.clone();
+                model.clone_from(value);
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
@@ -249,19 +249,14 @@ fn run_repl(model: String) -> Result<(), Box<dyn std::error::Error>> {
         if trimmed.is_empty() {
             continue;
         }
-        match trimmed {
-            "/exit" | "/quit" => break,
-            "/help" => {
-                println!("Available commands:");
-                println!("  /help    Show help");
-                println!("  /status  Show session status");
-                println!("  /compact Compact session history");
-                println!("  /exit    Quit the REPL");
-            }
-            "/status" => cli.print_status(),
-            "/compact" => cli.compact()?,
-            _ => cli.run_turn(trimmed)?,
+        if matches!(trimmed, "/exit" | "/quit") {
+            break;
         }
+        if let Some(command) = SlashCommand::parse(trimmed) {
+            cli.handle_repl_command(command)?;
+            continue;
+        }
+        cli.run_turn(trimmed)?;
     }
 
     Ok(())
@@ -319,15 +314,53 @@ impl LiveCli {
         }
     }
 
+    fn handle_repl_command(
+        &mut self,
+        command: SlashCommand,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match command {
+            SlashCommand::Help => println!("{}", render_repl_help()),
+            SlashCommand::Status => self.print_status(),
+            SlashCommand::Compact => self.compact()?,
+            SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::Unknown(name) => eprintln!("unknown slash command: /{name}"),
+        }
+        Ok(())
+    }
+
     fn print_status(&self) {
-        let usage = self.runtime.usage().cumulative_usage();
+        let cumulative = self.runtime.usage().cumulative_usage();
+        let latest = self.runtime.usage().current_turn_usage();
         println!(
-            "status: messages={} turns={} input_tokens={} output_tokens={}",
-            self.runtime.session().messages.len(),
-            self.runtime.usage().turns(),
-            usage.input_tokens,
-            usage.output_tokens
+            "{}",
+            format_status_line(
+                &self.model,
+                self.runtime.session().messages.len(),
+                self.runtime.usage().turns(),
+                latest,
+                cumulative,
+                self.runtime.estimated_tokens(),
+                permission_mode_label(),
+            )
         );
+    }
+
+    fn set_model(&mut self, model: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(model) = model else {
+            println!("Current model: {}", self.model);
+            return Ok(());
+        };
+
+        if model == self.model {
+            println!("Model already set to {model}.");
+            return Ok(());
+        }
+
+        let session = self.runtime.session().clone();
+        self.runtime = build_runtime(session, model.clone(), self.system_prompt.clone(), true)?;
+        self.model.clone_from(&model);
+        println!("Switched model to {model}.");
+        Ok(())
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -341,6 +374,39 @@ impl LiveCli {
         )?;
         println!("Compacted {removed} messages.");
         Ok(())
+    }
+}
+
+fn render_repl_help() -> String {
+    format!(
+        "{}
+  /exit                Quit the REPL",
+        render_slash_command_help()
+    )
+}
+
+fn format_status_line(
+    model: &str,
+    message_count: usize,
+    turns: u32,
+    latest: TokenUsage,
+    cumulative: TokenUsage,
+    estimated_tokens: usize,
+    permission_mode: &str,
+) -> String {
+    format!(
+        "status: model={model} permission_mode={permission_mode} messages={message_count} turns={turns} estimated_tokens={estimated_tokens} latest_tokens={} cumulative_input_tokens={} cumulative_output_tokens={} cumulative_total_tokens={}",
+        latest.total_tokens(),
+        cumulative.input_tokens,
+        cumulative.output_tokens,
+        cumulative.total_tokens(),
+    )
+}
+
+fn permission_mode_label() -> &'static str {
+    match env::var("RUSTY_CLAUDE_PERMISSION_MODE") {
+        Ok(value) if value == "read-only" => "read-only",
+        _ => "workspace-write",
     }
 }
 
@@ -388,6 +454,7 @@ impl AnthropicRuntimeClient {
 }
 
 impl ApiClient for AnthropicRuntimeClient {
+    #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let message_request = MessageRequest {
             model: self.model.clone(),
@@ -442,7 +509,7 @@ impl ApiClient for AnthropicRuntimeClient {
                         ContentBlockDelta::TextDelta { text } => {
                             if !text.is_empty() {
                                 write!(stdout, "{text}")
-                                    .and_then(|_| stdout.flush())
+                                    .and_then(|()| stdout.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                                 events.push(AssistantEvent::TextDelta(text));
                             }
@@ -512,7 +579,7 @@ fn push_output_block(
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
                 write!(out, "{text}")
-                    .and_then(|_| out.flush())
+                    .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 events.push(AssistantEvent::TextDelta(text));
             }
@@ -646,7 +713,7 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, CliAction, DEFAULT_MODEL};
+    use super::{format_status_line, parse_args, render_repl_help, CliAction, DEFAULT_MODEL};
     use runtime::{ContentBlock, ConversationMessage, MessageRole};
     use std::path::PathBuf;
 
@@ -708,6 +775,43 @@ mod tests {
                 command: Some("/compact".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn repl_help_includes_shared_commands_and_exit() {
+        let help = render_repl_help();
+        assert!(help.contains("/help"));
+        assert!(help.contains("/status"));
+        assert!(help.contains("/model [model]"));
+        assert!(help.contains("/exit"));
+    }
+
+    #[test]
+    fn status_line_reports_model_and_token_totals() {
+        let status = format_status_line(
+            "claude-sonnet",
+            7,
+            3,
+            runtime::TokenUsage {
+                input_tokens: 5,
+                output_tokens: 4,
+                cache_creation_input_tokens: 1,
+                cache_read_input_tokens: 0,
+            },
+            runtime::TokenUsage {
+                input_tokens: 20,
+                output_tokens: 8,
+                cache_creation_input_tokens: 2,
+                cache_read_input_tokens: 1,
+            },
+            128,
+            "workspace-write",
+        );
+        assert!(status.contains("model=claude-sonnet"));
+        assert!(status.contains("permission_mode=workspace-write"));
+        assert!(status.contains("messages=7"));
+        assert!(status.contains("latest_tokens=10"));
+        assert!(status.contains("cumulative_total_tokens=31"));
     }
 
     #[test]

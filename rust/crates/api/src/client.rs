@@ -158,7 +158,10 @@ impl AnthropicClient {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json");
 
-        let auth_header = self.auth_token.as_ref().map(|_| "Bearer [REDACTED]").unwrap_or("<absent>");
+        let auth_header = self
+            .auth_token
+            .as_ref()
+            .map_or("<absent>", |_| "Bearer [REDACTED]");
         eprintln!("[anthropic-client] headers x-api-key=[REDACTED] authorization={auth_header} anthropic-version={ANTHROPIC_VERSION} content-type=application/json");
 
         if let Some(auth_token) = &self.auth_token {
@@ -192,8 +195,7 @@ fn read_api_key() -> Result<String, ApiError> {
         Ok(_) => Err(ApiError::MissingApiKey),
         Err(std::env::VarError::NotPresent) => match std::env::var("ANTHROPIC_AUTH_TOKEN") {
             Ok(api_key) if !api_key.is_empty() => Ok(api_key),
-            Ok(_) => Err(ApiError::MissingApiKey),
-            Err(std::env::VarError::NotPresent) => Err(ApiError::MissingApiKey),
+            Ok(_) | Err(std::env::VarError::NotPresent) => Err(ApiError::MissingApiKey),
             Err(error) => Err(ApiError::from(error)),
         },
         Err(error) => Err(ApiError::from(error)),
@@ -303,12 +305,22 @@ struct AnthropicErrorBody {
 #[cfg(test)]
 mod tests {
     use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
     use crate::types::{ContentBlockDelta, MessageRequest};
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock should not be poisoned")
+    }
+
     #[test]
     fn read_api_key_requires_presence() {
+        let _guard = env_lock();
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
         let error = super::read_api_key().expect_err("missing key should error");
@@ -317,6 +329,7 @@ mod tests {
 
     #[test]
     fn read_api_key_requires_non_empty_value() {
+        let _guard = env_lock();
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "");
         std::env::remove_var("ANTHROPIC_API_KEY");
         let error = super::read_api_key().expect_err("empty key should error");
@@ -325,6 +338,7 @@ mod tests {
 
     #[test]
     fn read_api_key_prefers_api_key_env() {
+        let _guard = env_lock();
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
         std::env::set_var("ANTHROPIC_API_KEY", "legacy-key");
         assert_eq!(
@@ -337,6 +351,7 @@ mod tests {
 
     #[test]
     fn read_auth_token_reads_auth_token_env() {
+        let _guard = env_lock();
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
         assert_eq!(super::read_auth_token().as_deref(), Some("auth-token"));
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
